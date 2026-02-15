@@ -234,78 +234,151 @@ finalSim.orderBy(desc("cosine")).show(10,false)
 
 
 Q11.
+TF-IDF and Book Similarity (Cosine)
+Spark 3.4.x - Scala
 
-import spark.implicits._
+
+import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.functions._
 import org.apache.spark.ml.feature._
+import org.apache.spark.ml.functions._
 import org.apache.spark.ml.linalg._
 
-// Load 10 books
-val df = spark.sparkContext
+
+1. Create Spark Session
+
+val spark = SparkSession.builder()
+  .appName("Q11_TFIDF_BookSimilarity")
+  .master("local[*]")
+  .getOrCreate()
+
+import spark.implicits._
+
+ 2. Load 10 Books
+
+val books_df = spark.sparkContext
   .wholeTextFiles("books/D184MB/*.txt")
   .toDF("file_name", "text")
   .limit(10)
 
-println("Total Books: " + df.count())
+println("Total Books: " + books_df.count())
 
-// Cleaning
-val clean = df.withColumn(
-  "clean_text",
+
+3. Preprocessing
+    - Lowercase
+    - Remove punctuation
+    - Tokenize
+    - Remove stopwords
+
+val cleaned = books_df.withColumn(
+  "text",
   lower(regexp_replace($"text", "[^a-zA-Z\\s]", ""))
 )
 
-// Tokenization
-val words = new Tokenizer()
-  .setInputCol("clean_text")
+val tokenizer = new Tokenizer()
+  .setInputCol("text")
   .setOutputCol("words")
-  .transform(clean)
 
-// Stopword removal
-val filtered = new StopWordsRemover()
+val tokenized = tokenizer.transform(cleaned)
+
+val remover = new StopWordsRemover()
   .setInputCol("words")
   .setOutputCol("filtered")
-  .transform(words)
 
-// TF
-val tf = new HashingTF()
+val filtered = remover.transform(tokenized)
+
+
+4. TF Calculation (HashingTF)
+
+val hashingTF = new HashingTF()
   .setInputCol("filtered")
   .setOutputCol("tf")
   .setNumFeatures(1000)
-  .transform(filtered)
 
-// IDF
-val idfModel = new IDF()
+val tf = hashingTF.transform(filtered)
+
+5. IDF Calculation
+
+val idf = new IDF()
   .setInputCol("tf")
   .setOutputCol("tfidf")
-  .fit(tf)
 
-val tfidf = idfModel
-  .transform(tf)
-  .select("file_name", "tfidf")
+val idfModel = idf.fit(tf)
 
-println("TF-IDF Generated")
+val tfidf = idfModel.transform(tf)
+  .select($"file_name", $"tfidf")
 
-// Cosine Similarity
-val left = tfidf.select($"file_name".as("fileA"), $"tfidf".as("vecA"))
-val right = tfidf.select($"file_name".as("fileB"), $"tfidf".as("vecB"))
+println("TF-IDF computed for books: " + tfidf.count())
 
+
+6. Prepare for Cosine Similarity
+
+val left = tfidf.select(
+  $"file_name".as("fileA"),
+  $"tfidf".as("vecA")
+)
+
+val right = tfidf.select(
+  $"file_name".as("fileB"),
+  $"tfidf".as("vecB")
+)
+
+Cross join all pairs except self
 val cross = left.crossJoin(right)
   .filter($"fileA" =!= $"fileB")
 
-val cosineUDF = udf((v1: Vector, v2: Vector) => {
-  val dot = v1.asBreeze.dot(v2.asBreeze)
-  val normA = breeze.linalg.norm(v1.asBreeze)
-  val normB = breeze.linalg.norm(v2.asBreeze)
-  dot / (normA * normB)
-})
+println("Total pairs: " + cross.count())
 
-val finalSim = cross.withColumn(
-  "cosine",
-  cosineUDF($"vecA", $"vecB")
+ 7. Convert Vectors to Arrays
+
+val crossArr = cross
+  .withColumn("arrA", vector_to_array($"vecA"))
+  .withColumn("arrB", vector_to_array($"vecB"))
+
+
+8. Compute Dot Product
+
+val withDot = crossArr.withColumn(
+  "dot",
+  expr("""
+    aggregate(
+      zip_with(arrA, arrB, (x,y) -> x*y),
+      0D,
+      (acc,x) -> acc + x
+    )
+  """)
 )
 
-finalSim.orderBy(desc("cosine")).show(10, false)
 
+9. Compute Norms
+
+val withNorm = withDot
+  .withColumn(
+    "normA",
+    expr("sqrt(aggregate(arrA, 0D, (acc,x) -> acc + x*x))")
+  )
+  .withColumn(
+    "normB",
+    expr("sqrt(aggregate(arrB, 0D, (acc,x) -> acc + x*x))")
+  )
+
+10. Cosine Similarity
+
+val finalSim = withNorm.withColumn(
+  "cosine",
+  $"dot" / ($"normA" * $"normB")
+)
+
+
+11. Top 5 Similar Books to 10.txt
+
+println("Top 5 Similar Books to 10.txt")
+
+finalSim
+  .filter($"fileA".contains("10.txt"))
+  .select("fileA", "fileB", "cosine")
+  .orderBy(desc("cosine"))
+  .show(5, false)
 
 
 Q12_AuthorInfluenceNetwork
